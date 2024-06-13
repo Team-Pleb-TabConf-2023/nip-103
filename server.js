@@ -1,10 +1,11 @@
 const WebSocket = require("ws");
 const express = require("express");
 const cors = require('cors');
-const app = express();
 const axios = require("axios");
 const bolt11 = require("bolt11");
 const bodyParser = require("body-parser");
+const { getBitcoinPrice } = require('./lib/bitcoinPrice');
+const crypto = require('crypto');
 const {
   relayInit,
   getPublicKey,
@@ -22,6 +23,8 @@ const { sleep } = require("./lib/helpers");
 
 require("dotenv").config();
 global.WebSocket = WebSocket;
+
+const app = express();
 
 const mongoose = require("mongoose");
 
@@ -66,6 +69,18 @@ function getLNURL() {
   const username = parts[0];
   const domain = parts[1];
   return `https://${domain}/.well-known/lnurlp/${username}`;
+}
+
+// Function to return the SHA256 hash of a given string
+function sha256Hash(obj) {
+  // Create a SHA256 hash
+  const hash = crypto.createHash('sha256');
+
+  // Update the hash with the string
+  hash.update(JSON.stringify(obj));
+
+  // Return the hash digest in hexadecimal format
+  return hash.digest('hex');
 }
 
 async function createNewJobDocument(service, invoice, paymentHash, price) {
@@ -125,7 +140,7 @@ async function getPaymentHash(invoice) {
 }
 
 async function generateInvoice(service) {
-  const msats = getServicePrice(service);
+  const msats = await getServicePrice(service);
   const lnurlResponse = await axios.get(getLNURL(), {
     headers: {
       Accept: "application/json",
@@ -161,10 +176,11 @@ async function generateInvoice(service) {
 function getSuccessAction(service, paymentHash) {
   return {
     tag: "url",
-    url: `http://localhost:3000/${service}/${paymentHash}/get_result`,
+    url: `${process.env.ENDPOINT}/${service}/${paymentHash}/get_result`,
     description: "Open to get the confirmation code for your purchase.",
   };
 }
+
 
 // --------------------- ENDPOINTS -----------------------------
 
@@ -174,6 +190,8 @@ app.use(bodyParser.json());
 
 app.post("/:service", async (req, res) => {
   try {
+    console.log("Rendering service:", req.params.service);
+    console.log("full req:",req)
     const service = req.params.service;
     const invoice = await generateInvoice(service);
     const doc = await findJobRequestByPaymentHash(invoice.paymentHash);
@@ -186,6 +204,7 @@ app.post("/:service", async (req, res) => {
 
     res.status(402).send(invoice);
   } catch (e) {
+    console.log("Error rendering service invoice:")
     console.log(e.toString().substring(0, 150));
     res.status(500).send(e);
   }
@@ -253,12 +272,21 @@ app.get("/:service/:payment_hash/check_payment", async (req, res) => {
 
 // --------------------- SERVICES -----------------------------
 
-function getServicePrice(service) {
+function usd_to_millisats(servicePriceUSD, bitcoinPrice) {
+  const profitMarginFactor = 1.0 + process.env.PROFIT_MARGIN_PCT / 100.0;
+  const rawValue = (servicePriceUSD * 100000000000 * profitMarginFactor) / bitcoinPrice;
+  const roundedValue = Math.round(rawValue / 1000) * 1000; // Round to the nearest multiple of 1000
+  return roundedValue;
+}
+
+async function getServicePrice(service) {
+  const bitcoinPrice = await getBitcoinPrice(); 
+  
   switch (service) {
     case "GPT":
-      return process.env.GPT_MSATS;
+      return usd_to_millisats(process.env.GPT_USD,bitcoinPrice);
     case "STABLE":
-      return process.env.STABLE_DIFFUSION_MSATS;
+      return usd_to_millisats(process.env.STABLE_DIFFUSION_USD,bitcoinPrice);
     default:
       return process.env.GPT_MSATS;
   }
@@ -270,9 +298,15 @@ function submitService(service, data) {
       return callChatGPT(data);
     case "STABLE":
       return callStableDiffusion(data);
+    case "YTDL":
+      return callYitter(data);
     default:
       return callChatGPT(data);
   }
+}
+
+async function callYitter(data){
+  
 }
 
 async function callChatGPT(data) {
@@ -340,6 +374,13 @@ function createOfferingNote(
 ) {
   const now = Math.floor(Date.now() / 1000);
 
+  console.log(typeof(outputSchema))
+  const outputHash = sha256Hash(outputSchema);
+  console.log(`outputHash:${outputHash}`)
+
+  const inputHash = sha256Hash(inputSchema);
+  console.log(`inputHash:${inputHash}`)
+
   const content = {
     endpoint, // string
     status, // UP/DOWN/CLOSED
@@ -347,6 +388,8 @@ function createOfferingNote(
     inputSchema, // Json Schema
     outputSchema, // Json Schema
     description, // string / NULL
+    inputHash,
+    outputHash
   };
 
   let offeringEvent = {
@@ -379,11 +422,13 @@ async function postOfferings() {
   });
   await relay.connect();
 
+  const gptPrice = await getServicePrice("GPT")
+
   const gptOffering = createOfferingNote(
     pk,
     sk,
     "https://api.openai.com/v1/chat/completions",
-    Number(process.env.GPT_MSATS),
+    Number(gptPrice),
     process.env.ENDPOINT + "/" + "GPT",
     "UP",
     GPT_SCHEMA,
@@ -394,11 +439,12 @@ async function postOfferings() {
   await relay.publish(gptOffering);
   console.log(`Published GPT Offering: ${gptOffering.id}`);
 
+  const stablePrice = await getServicePrice("STABLE")
   const sdOffering = createOfferingNote(
     pk,
     sk,
     "https://stablediffusionapi.com/api/v4/dreambooth",
-    Number(process.env.STABLE_DIFFUSION_MSATS),
+    Number(stablePrice),
     process.env.ENDPOINT + "/" + "STABLE",
     "UP",
     STABLE_DIFFUSION_SCHEMA,
@@ -413,15 +459,17 @@ async function postOfferings() {
 }
 
 postOfferings();
+setInterval(postOfferings, 300000);
+
 
 // --------------------- SERVER -----------------------------
 
 let port = process.env.PORT;
 if (port == null || port == "") {
-  port = 3000;
+  port = 6969;
 }
 
-app.listen(port, function () {
-  console.log("Starting NST Backend...");
+app.listen(port, async function () {
+  console.log("Starting NIP105 Server...");
   console.log(`Server started on port ${port}.`);
 });
